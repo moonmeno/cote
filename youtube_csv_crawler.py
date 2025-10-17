@@ -340,10 +340,11 @@ def fetch_category_video_ids(
         published_before = new_boundary
         page_token = None
 
-        # API가 결과는 주었으나 신규 영상이 하나도 없었다면, 추가 진행의 의미가 없다.
-        if new_items == 0:
-            after_dt = _parse_published_at(published_after) if published_after else None
-            if after_dt is None or boundary_dt <= after_dt:
+        # API가 결과는 주었으나 신규 영상이 하나도 없었다면,
+        # 명시적인 published_after 경계를 넘지 않는 한 과거 탐색을 계속한다.
+        if new_items == 0 and published_after:
+            after_dt = _parse_published_at(published_after)
+            if after_dt and boundary_dt <= after_dt:
                 break
 
     return collected
