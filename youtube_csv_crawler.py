@@ -1,27 +1,35 @@
-"""YouTube CSV Crawler
-======================
+"""YouTube 카테고리 크롤러 (한국어 전용 확장)
+===========================================
 
-이 스크립트는 YouTube Data API를 활용하여 영상 및 채널 메타데이터를
-수집하고 CSV 파일로 저장한다. 복수 개의 API 키를 순환하여 쿼터 초과
-상황을 최소화하며, 이미 저장된 CSV 데이터를 다시 불러와 중복을
-방지한다. 또한 `--export-titles` 옵션을 사용하면 기존 영상 데이터에서
-제목만 추출하여 자연어 처리(NLP)나 키워드 분석에 활용할 수 있다.
+이 스크립트는 단일 카테고리를 대상으로 최신 영상을 최대 5,000건까지
+수집하고, 해당 영상의 채널 정보를 모은 뒤 채널 업로드 내역을 분석하여
+카테고리 전문 채널을 식별한다. 요구 사항은 다음과 같다.
 
-사용 예시:
+* YouTube Data API를 사용하며 복수 개의 API 키를 순환해 사용한다.
+* `search.list(order=date)`를 이용해 지정 카테고리의 최신 영상을 가져오되
+  한국어 제목만 필터링한다.
+* 수집한 영상의 채널 가운데 구독자 수가 10,000명 이상인 채널만 남긴다.
+* 채널 업로드 영상을 검사하여 목표 카테고리의 비중이 80% 이상이면
+  카테고리 채널로 판정하고 CSV로 저장한다.
+* 모든 산출물은 CSV 파일로 기록하여 후속 분석에 활용한다.
 
-1. 카테고리별 영상 메타데이터 수집
+명령행 예시::
 
-   python youtube_csv_crawler.py --api-keys "KEY1,KEY2,KEY3" --categories 17,10 \
-       --per-category 300 --region KR --published-after 2025-01-01T00:00:00Z
+    python youtube_csv_crawler.py \
+        --api-keys "KEY1,KEY2,KEY3,KEY4,KEY5" \
+        --category 17 \
+        --region KR \
+        --max-videos 5000 \
+        --korean-only --ko-threshold 0.6 \
+        --min-subscribers 10000 \
+        --uploads-per-channel 50 \
+        --category-ratio 0.8 \
+        --videos-file videos.csv \
+        --channels-file channels.csv \
+        --channel-report category_channels.csv
 
-2. 저장된 영상 CSV에서 제목만 추출하여 별도 파일로 내보내기
-
-   python youtube_csv_crawler.py --export-titles titles.csv
-
-필수 준비 사항:
-- 실제 발급받은 YouTube Data API 키를 `--api-keys` 인자로 전달해야 한다.
-- 크롤링 모드를 사용할 때는 조회할 카테고리 ID를 `--categories` 인자로
-  지정해야 한다.
+`--export-titles` 옵션을 사용하면 기존 `videos.csv`에서 제목만 추출하여
+별도 CSV 파일로 내보낼 수 있다.
 """
 import argparse
 import csv
@@ -29,7 +37,7 @@ import json
 import os
 import re
 import time
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import requests
 
@@ -42,6 +50,32 @@ QUOTA_ERROR_REASONS = {
 }
 
 ZERO_WIDTH_PATTERN = re.compile(r"[\u200B-\u200D\uFEFF]")
+
+
+def normalize_text(value: Optional[str]) -> str:
+    """문자열에서 제로 폭 문자를 제거하고 양 끝 공백을 정리한다."""
+
+    if not value:
+        return ""
+    return ZERO_WIDTH_PATTERN.sub("", value).strip()
+
+
+def is_korean_title(title: str, threshold: float) -> bool:
+    """제목에서 한글 비중이 threshold 이상인지 판별한다."""
+
+    if not title:
+        return False
+    total = 0
+    korean = 0
+    for ch in title:
+        if ch.isspace():
+            continue
+        total += 1
+        if "가" <= ch <= "힣":
+            korean += 1
+    if total == 0:
+        return False
+    return (korean / total) >= threshold
 
 
 class APIKeyManager:
@@ -175,11 +209,9 @@ def ensure_csv_headers(file_path: str, headers: List[str]) -> None:
 
 
 def clean_text(value: Optional[str]) -> str:
-    """텍스트에서 제로 폭 문자를 제거하고 공백을 정리한다."""
-    if not value:
-        return ""
-    cleaned = ZERO_WIDTH_PATTERN.sub("", value)
-    return cleaned.strip()
+    """normalize_text의 별칭. 과거 함수명을 유지하기 위해 둔다."""
+
+    return normalize_text(value)
 
 
 def chunked(iterable: List[str], size: int) -> Iterable[List[str]]:
@@ -192,24 +224,25 @@ def chunked(iterable: List[str], size: int) -> Iterable[List[str]]:
         yield iterable[i : i + size]
 
 
-def fetch_search_results(
+def fetch_category_video_ids(
     client: YouTubeAPIClient,
     category_id: str,
-    per_category: int,
+    max_videos: int,
     region: str,
     published_after: Optional[str],
+    existing_video_ids: Set[str],
+    korean_only: bool,
+    ko_threshold: float,
 ) -> List[str]:
-    """search.list API를 사용해 영상 ID 목록을 수집한다.
+    """지정한 카테고리에서 최신 영상 ID를 수집한다."""
 
-    카테고리, 지역, 게시일 필터 등을 조합하여 최신 영상을 가져오며,
-    `per_category` 한도를 만족할 때까지 페이지네이션을 반복한다.
-    """
     collected: List[str] = []
+    seen: Set[str] = set()
     page_token: Optional[str] = None
 
-    while len(collected) < per_category:
+    while len(collected) < max_videos:
         params = {
-            "part": "id",
+            "part": "id,snippet",
             "type": "video",
             "order": "date",
             "videoCategoryId": category_id,
@@ -223,14 +256,25 @@ def fetch_search_results(
 
         data = client.request("search", params)
         items = data.get("items", [])
+        if not items:
+            break
+
         for item in items:
-            kind = item.get("id", {}).get("kind")
-            if kind != "youtube#video":
+            id_info = item.get("id", {})
+            if id_info.get("kind") != "youtube#video":
                 continue
-            video_id = item.get("id", {}).get("videoId")
-            if video_id:
-                collected.append(video_id)
-            if len(collected) >= per_category:
+            video_id = id_info.get("videoId")
+            if not video_id or video_id in existing_video_ids or video_id in seen:
+                continue
+
+            if korean_only:
+                title = normalize_text(item.get("snippet", {}).get("title", ""))
+                if not is_korean_title(title, threshold=ko_threshold):
+                    continue
+
+            collected.append(video_id)
+            seen.add(video_id)
+            if len(collected) >= max_videos:
                 break
 
         page_token = data.get("nextPageToken")
@@ -268,7 +312,7 @@ def fetch_channel_details(client: YouTubeAPIClient, channel_ids: Iterable[str]) 
     channel_list = list(channel_ids)
     for batch in chunked(channel_list, 50):
         params = {
-            "part": "snippet,statistics",
+            "part": "snippet,statistics,contentDetails",
             "id": ",".join(batch),
             "maxResults": "50",
         }
@@ -277,13 +321,81 @@ def fetch_channel_details(client: YouTubeAPIClient, channel_ids: Iterable[str]) 
     return details
 
 
+def fetch_channel_uploads(
+    client: YouTubeAPIClient,
+    uploads_playlist_id: str,
+    limit: int,
+) -> List[str]:
+    """채널 업로드 플레이리스트에서 최신 영상 ID를 추출한다."""
+
+    collected: List[str] = []
+    page_token: Optional[str] = None
+
+    while len(collected) < limit:
+        params = {
+            "part": "snippet",
+            "playlistId": uploads_playlist_id,
+            "maxResults": "50",
+        }
+        if page_token:
+            params["pageToken"] = page_token
+
+        data = client.request("playlistItems", params)
+        items = data.get("items", [])
+        if not items:
+            break
+
+        for item in items:
+            snippet = item.get("snippet", {})
+            resource = snippet.get("resourceId", {})
+            video_id = resource.get("videoId")
+            if not video_id:
+                continue
+            collected.append(video_id)
+            if len(collected) >= limit:
+                break
+
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+
+    return collected
+
+
+def fetch_video_categories(client: YouTubeAPIClient, video_ids: List[str]) -> Dict[str, str]:
+    """videos.list 호출을 통해 영상별 카테고리 ID를 확인한다."""
+
+    categories: Dict[str, str] = {}
+    for batch in chunked(video_ids, 50):
+        params = {
+            "part": "snippet",
+            "id": ",".join(batch),
+            "maxResults": "50",
+        }
+        data = client.request("videos", params)
+        for item in data.get("items", []):
+            video_id = item.get("id")
+            category_id = item.get("snippet", {}).get("categoryId")
+            if video_id and category_id:
+                categories[video_id] = category_id
+    return categories
+
+
 def save_videos(file_path: str, videos: List[Dict]) -> None:
     """영상 정보를 CSV 파일에 저장한다.
 
     videos.csv에는 영상 ID, 카테고리, 채널, 게시일, 통계(JSON 문자열) 등
     핵심 메타데이터를 기록한다.
     """
-    headers = ["videoId", "categoryId", "title", "channelId", "publishedAt", "statistics"]
+    headers = [
+        "videoId",
+        "categoryId",
+        "title",
+        "channelId",
+        "channelTitle",
+        "publishedAt",
+        "statistics",
+    ]
     ensure_csv_headers(file_path, headers)
 
     with open(file_path, "a", encoding="utf-8", newline="") as f:
@@ -306,6 +418,7 @@ def save_channels(file_path: str, channels: List[Dict]) -> None:
         "publishedAt",
         "country",
         "statistics",
+        "subscriberCount",
     ]
     ensure_csv_headers(file_path, headers)
 
@@ -315,13 +428,34 @@ def save_channels(file_path: str, channels: List[Dict]) -> None:
             writer.writerow(channel)
 
 
+def save_category_channels(file_path: str, records: List[Dict]) -> None:
+    """카테고리 판정을 통과한 채널 정보를 CSV에 저장한다."""
+
+    headers = [
+        "channelId",
+        "title",
+        "categoryId",
+        "matchedVideoCount",
+        "sampledVideoCount",
+        "matchedRatio",
+        "subscriberCount",
+    ]
+    ensure_csv_headers(file_path, headers)
+
+    with open(file_path, "a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        for record in records:
+            writer.writerow(record)
+
+
 def crawl(args: argparse.Namespace) -> None:
     """크롤링 작업의 메인 로직.
 
     1. API 키 매니저 및 클라이언트를 초기화한다.
-    2. 기존 videos.csv / channels.csv를 로드하여 중복을 필터링한다.
-    3. 지정된 카테고리마다 search -> videos -> channels 순서로 데이터를
-       수집하고 CSV로 저장한다.
+    2. 기존 CSV를 로드하여 중복을 제거한다.
+    3. 단일 카테고리에서 최신 영상 ID를 수집하고 세부 정보를 저장한다.
+    4. 관련 채널 가운데 구독자 조건을 통과한 항목을 선별해 저장한다.
+    5. 채널 업로드 영상을 분석해 카테고리 채널을 판정하고 결과를 기록한다.
     """
     keys = [k.strip() for k in args.api_keys.split(",") if k.strip()]
     key_manager = APIKeyManager(keys)
@@ -333,47 +467,53 @@ def crawl(args: argparse.Namespace) -> None:
     existing_video_ids = read_existing_ids(videos_file, "videoId")
     existing_channel_ids = read_existing_ids(channels_file, "channelId")
 
-    categories = [c.strip() for c in args.categories.split(",") if c.strip()]
-    print(f"[안내] 총 {len(categories)}개의 카테고리를 대상으로 크롤링을 시작합니다.")
+    target_category = args.category
+    print(f"[안내] 카테고리 {target_category}에 대한 크롤링을 시작합니다.")
 
+    video_ids = fetch_category_video_ids(
+        client,
+        category_id=target_category,
+        max_videos=args.max_videos,
+        region=args.region,
+        published_after=args.published_after,
+        existing_video_ids=existing_video_ids,
+        korean_only=args.korean_only,
+        ko_threshold=args.ko_threshold,
+    )
+
+    if not video_ids:
+        print("[안내] 수집할 신규 영상이 없습니다.")
+        return
+
+    details = fetch_video_details(client, video_ids)
     new_videos: List[Dict] = []
     channel_ids_to_fetch: Set[str] = set()
 
-    for category_id in categories:
-        print(f"[안내] 카테고리 {category_id} 처리 중...")
-        video_ids = fetch_search_results(
-            client,
-            category_id=category_id,
-            per_category=args.per_category,
-            region=args.region,
-            published_after=args.published_after,
-        )
-        filtered_video_ids = [vid for vid in video_ids if vid not in existing_video_ids]
-        if not filtered_video_ids:
-            print(f"[안내] 카테고리 {category_id}에서 신규 영상이 없습니다.")
+    for item in details:
+        video_id = item.get("id")
+        if not video_id or video_id in existing_video_ids:
             continue
 
-        details = fetch_video_details(client, filtered_video_ids)
-        for item in details:
-            video_id = item.get("id")
-            if not video_id or video_id in existing_video_ids:
-                continue
-            snippet = item.get("snippet", {})
-            title = clean_text(snippet.get("title", ""))
-            channel_id = snippet.get("channelId", "")
-            if channel_id:
-                channel_ids_to_fetch.add(channel_id)
+        snippet = item.get("snippet", {})
+        title = clean_text(snippet.get("title", ""))
+        if args.korean_only and not is_korean_title(title, threshold=args.ko_threshold):
+            continue
 
-            video_record = {
-                "videoId": video_id,
-                "categoryId": category_id,
-                "title": title,
-                "channelId": channel_id,
-                "publishedAt": snippet.get("publishedAt", ""),
-                "statistics": json.dumps(item.get("statistics", {}), ensure_ascii=False),
-            }
-            new_videos.append(video_record)
-            existing_video_ids.add(video_id)
+        channel_id = snippet.get("channelId", "")
+        if channel_id:
+            channel_ids_to_fetch.add(channel_id)
+
+        video_record = {
+            "videoId": video_id,
+            "categoryId": snippet.get("categoryId", target_category),
+            "title": title,
+            "channelId": channel_id,
+            "channelTitle": clean_text(snippet.get("channelTitle", "")),
+            "publishedAt": snippet.get("publishedAt", ""),
+            "statistics": json.dumps(item.get("statistics", {}), ensure_ascii=False),
+        }
+        new_videos.append(video_record)
+        existing_video_ids.add(video_id)
 
     if new_videos:
         save_videos(videos_file, new_videos)
@@ -387,12 +527,29 @@ def crawl(args: argparse.Namespace) -> None:
         return
 
     channel_details = fetch_channel_details(client, new_channel_ids)
+    eligible_channels: List[Tuple[Dict, int]] = []
     new_channels: List[Dict] = []
+
     for item in channel_details:
         channel_id = item.get("id")
         if not channel_id or channel_id in existing_channel_ids:
             continue
+
         snippet = item.get("snippet", {})
+        statistics = item.get("statistics", {})
+        subscriber_str = statistics.get("subscriberCount")
+        try:
+            subscriber_count = int(subscriber_str)
+        except (TypeError, ValueError):
+            subscriber_count = 0
+
+        if subscriber_count < args.min_subscribers:
+            print(
+                f"[안내] 채널 {channel_id} 구독자 수 {subscriber_count}명으로 기준 미달 (최소 {args.min_subscribers}).",
+            )
+            existing_channel_ids.add(channel_id)
+            continue
+
         channel_record = {
             "channelId": channel_id,
             "title": clean_text(snippet.get("title", "")),
@@ -400,16 +557,92 @@ def crawl(args: argparse.Namespace) -> None:
             "customUrl": snippet.get("customUrl", ""),
             "publishedAt": snippet.get("publishedAt", ""),
             "country": snippet.get("country", ""),
-            "statistics": json.dumps(item.get("statistics", {}), ensure_ascii=False),
+            "statistics": json.dumps(statistics, ensure_ascii=False),
+            "subscriberCount": subscriber_count,
         }
         new_channels.append(channel_record)
+        eligible_channels.append((item, subscriber_count))
         existing_channel_ids.add(channel_id)
 
     if new_channels:
         save_channels(channels_file, new_channels)
-        print(f"[완료] {len(new_channels)}개의 신규 채널을 저장했습니다.")
+        print(f"[완료] {len(new_channels)}개의 채널 정보를 저장했습니다.")
     else:
-        print("[안내] 채널 API에서 데이터를 찾지 못했습니다.")
+        print("[안내] 저장할 신규 채널이 없습니다.")
+
+    if not eligible_channels:
+        print("[안내] 카테고리 판정을 수행할 채널이 없습니다.")
+        return
+
+    existing_category_channels = read_existing_ids(args.channel_report, "channelId")
+    classified_channels: List[Dict] = []
+    passed = 0
+    failed = 0
+
+    for item, subscriber_count in eligible_channels:
+        channel_id = item.get("id")
+        if not channel_id or channel_id in existing_category_channels:
+            continue
+
+        uploads_playlist = (
+            item.get("contentDetails", {})
+            .get("relatedPlaylists", {})
+            .get("uploads")
+        )
+        if not uploads_playlist:
+            print(f"[안내] 채널 {channel_id}은 업로드 플레이리스트 ID가 없습니다.")
+            failed += 1
+            continue
+
+        upload_video_ids = fetch_channel_uploads(
+            client,
+            uploads_playlist_id=uploads_playlist,
+            limit=args.uploads_per_channel,
+        )
+        if not upload_video_ids:
+            print(f"[안내] 채널 {channel_id}은 업로드 영상이 부족합니다.")
+            failed += 1
+            continue
+
+        categories = fetch_video_categories(client, upload_video_ids)
+        if not categories:
+            print(f"[안내] 채널 {channel_id} 영상 카테고리를 확인할 수 없습니다.")
+            failed += 1
+            continue
+
+        matched = sum(1 for cat in categories.values() if cat == target_category)
+        total = len(categories)
+        ratio = matched / total if total else 0.0
+
+        if ratio >= args.category_ratio:
+            classified_channels.append(
+                {
+                    "channelId": channel_id,
+                    "title": clean_text(item.get("snippet", {}).get("title", "")),
+                    "categoryId": target_category,
+                    "matchedVideoCount": matched,
+                    "sampledVideoCount": total,
+                    "matchedRatio": f"{ratio:.3f}",
+                    "subscriberCount": subscriber_count,
+                }
+            )
+            existing_category_channels.add(channel_id)
+            passed += 1
+        else:
+            print(
+                f"[안내] 채널 {channel_id} 카테고리 일치율 {ratio:.2%}로 기준 미달 (요구치 {args.category_ratio:.0%}).",
+            )
+            failed += 1
+
+    if classified_channels:
+        save_category_channels(args.channel_report, classified_channels)
+        print(f"[완료] {len(classified_channels)}개의 카테고리 채널을 저장했습니다.")
+    else:
+        print("[안내] 저장할 카테고리 채널이 없습니다.")
+
+    print(
+        f"[요약] 판정 통과: {passed}개, 판정 실패: {failed}개",
+    )
 
 
 def export_titles(args: argparse.Namespace) -> None:
@@ -458,15 +691,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="쉼표로 구분된 YouTube Data API 키 목록",
     )
     parser.add_argument(
-        "--categories",
-        default="",
-        help="쉼표로 구분된 카테고리 ID 목록",
+        "--category",
+        help="단일 카테고리 ID (예: 17)",
     )
     parser.add_argument(
-        "--per-category",
+        "--max-videos",
         type=int,
-        default=50,
-        help="카테고리별 최대 수집 영상 수",
+        default=5000,
+        help="카테고리에서 최대 수집할 영상 수 (기본 5000)",
     )
     parser.add_argument(
         "--region",
@@ -489,8 +721,42 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="채널 메타데이터를 저장할 CSV 경로",
     )
     parser.add_argument(
+        "--channel-report",
+        default="category_channels.csv",
+        help="카테고리 채널 판정 결과를 저장할 CSV 경로",
+    )
+    parser.add_argument(
         "--export-titles",
         help="영상 제목만 별도 CSV로 내보내기",
+    )
+    parser.add_argument(
+        "--korean-only",
+        action="store_true",
+        help="한국어 제목만 수집",
+    )
+    parser.add_argument(
+        "--ko-threshold",
+        type=float,
+        default=0.5,
+        help="한국어 비율 임계값 (0~1, 기본 0.5)",
+    )
+    parser.add_argument(
+        "--min-subscribers",
+        type=int,
+        default=10000,
+        help="유지할 최소 구독자 수 (기본 10000)",
+    )
+    parser.add_argument(
+        "--uploads-per-channel",
+        type=int,
+        default=50,
+        help="채널 판정 시 확인할 최신 업로드 수",
+    )
+    parser.add_argument(
+        "--category-ratio",
+        type=float,
+        default=0.8,
+        help="채널을 카테고리 채널로 인정할 최소 비율 (기본 0.8)",
     )
 
     args = parser.parse_args(argv)
@@ -501,8 +767,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     if not args.api_keys:
         parser.error("크롤링을 위해서는 --api-keys 인자가 필요합니다.")
 
-    if not args.categories:
-        parser.error("크롤링을 위해서는 --categories 인자가 필요합니다.")
+    if not args.category:
+        parser.error("크롤링을 위해서는 --category 인자가 필요합니다.")
 
     return args
 
